@@ -1,0 +1,27 @@
+# Bun / Node
+node_modules/
+
+# Kompilierte Single-Binaries (95–111 MB) — via GitHub Releases verteilt, NICHT im git
+dist/
+
+# Secrets — NIEMALS committen (inkl. ALLER .env-Varianten + Backups!)
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.token
+credentials/
+
+# Lokaler Laufzeit-State (DB/Tokens/Audit liegen ohnehin im stateDir außerhalb)
+*.sqlite
+*.sqlite-*
+*.db
+*.db-*
+
+# OS / Misc
+.DS_Store
+*.log
+*.bak-*
+
+# Bewusst COMMITTEN: bun.lock/bun.lockb, package.json

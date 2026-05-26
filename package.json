@@ -1,0 +1,28 @@
+{
+  "name": "subunit-bridge",
+  "version": "0.1.1",
+  "description": "Subunit Bridge Daemon — local cross-app sync + MCP server",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "bun --hot src/main.ts",
+    "start": "bun src/main.ts",
+    "mcp": "bun src/mcp.ts",
+    "build": "bun build src/main.ts --compile --outfile dist/subunit-bridge",
+    "build:mcp": "bun build src/mcp.ts --compile --outfile dist/subunit-bridge-mcp",
+    "test": "bun test"
+  },
+  "bin": {
+    "subunit-bridge": "src/main.ts",
+    "subunit-bridge-mcp": "src/mcp.ts"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "hono": "^4.6.0",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "^5.5.0"
+  }
+}
