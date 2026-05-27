@@ -1,0 +1,50 @@
+name: Release
+# Tag v* pushen → baut die Bun-Compile-Binaries für alle Target-Triples (die Tauris
+# externalBin erwartet) + SHA-256-Manifest und veröffentlicht ein ECHTES Release
+# (kein Draft). So hat die Bridge eigene, sichtbare, versionierte Artefakte — die
+# sonar-tauri künftig direkt konsumieren kann (statt aus dem Source zu bauen).
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with: { bun-version: 1.3.11 }
+      - name: Install (strict — Lockfile-Disziplin)
+        run: bun install --frozen-lockfile
+      - name: Build alle Targets (bun --compile) + SHA-256-Manifest
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          # Tauri-Target-Triple → Bun-Compile-Target (identisch zu sonar-tauri/scripts/fetch-sidecars.sh).
+          # Win-ARM = x64 via Emulation (Bun hat kein windows-arm64).
+          declare -A TARGETS=(
+            ["x86_64-unknown-linux-gnu"]="bun-linux-x64"
+            ["x86_64-pc-windows-msvc"]="bun-windows-x64"
+            ["aarch64-pc-windows-msvc"]="bun-windows-x64"
+            ["x86_64-apple-darwin"]="bun-darwin-x64"
+            ["aarch64-apple-darwin"]="bun-darwin-arm64"
+          )
+          for triple in "${!TARGETS[@]}"; do
+            ext=""; [[ "$triple" == *windows* ]] && ext=".exe"
+            out="dist/subunit-bridge-$triple$ext"
+            echo "build $triple (${TARGETS[$triple]}) → $out"
+            bun build src/main.ts --compile --target="${TARGETS[$triple]}" --outfile "$out"
+          done
+          ( cd dist && sha256sum subunit-bridge-* > SHA256SUMS.txt && cat SHA256SUMS.txt )
+      - name: Release veröffentlichen (gh — kein Draft)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${{ github.ref_name }}" \
+            --title "Subunit Bridge ${{ github.ref_name }}" \
+            --notes "Bun-Compile-Binaries für alle Target-Triples + SHA256SUMS.txt. Konsumierbar als Sonar-Sidecar." \
+            dist/subunit-bridge-* dist/SHA256SUMS.txt
