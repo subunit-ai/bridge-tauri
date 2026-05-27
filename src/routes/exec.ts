@@ -31,6 +31,8 @@ execRoutes.get("/status", (c) => {
 });
 
 execRoutes.post("/local", async (c) => {
+  // Local-token-gated self-test only. Remote WS exec cannot enter here
+  // and must pass Ed25519 approval plus local consent in ws-client.ts.
   const body = LocalExecSchema.safeParse(await c.req.json().catch(() => ({})));
   if (!body.success) {
     return c.json({ error: "invalid_request", issues: body.error.issues }, 400);

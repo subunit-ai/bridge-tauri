@@ -18,7 +18,23 @@ import { createHash, verify } from "node:crypto";
 import { ensureFreshAccessToken } from "./auth-client.ts";
 import { loadTokens } from "../storage/tokens.ts";
 import { config } from "../config.ts";
-import { runExec } from "../exec/runner.ts";
+import {
+  createVerifiedApprovalProof,
+  killActiveRemoteExecChildren,
+  runRemoteExec,
+  type VerifiedApprovalProof,
+} from "../exec/runner.ts";
+import {
+  awaitConsent,
+  consumeAllowedConsent,
+  createConsentReservation,
+  decide,
+  expireOpenConsentRequests,
+  hasMatchingSessionGrant,
+  isRemoteAccessRevoked,
+  markConsentRevoked,
+  type ConsumedConsentProof,
+} from "../exec/consent.ts";
 
 const PING_INTERVAL_MS = 30_000;
 const SERVER_SILENCE_TIMEOUT_MS = 90_000; // 3 missed pings → force reconnect
@@ -43,9 +59,12 @@ let activeSocket: WebSocket | null = null;
 const seenExecRequestIds = new Map<string, number>();
 const seenExecNonces = new Map<string, number>();
 
-export function disconnectWsClient(): void {
+export function disconnectWsClient(reason = "logout"): void {
+  if (reason === "logout" || reason === "remote_access_revoked") {
+    killActiveRemoteExecChildren(reason);
+  }
   if (activeSocket) {
-    try { activeSocket.close(4001, "logout"); } catch { /* ignored */ }
+    try { activeSocket.close(4001, reason); } catch { /* ignored */ }
     activeSocket = null;
   }
 }
@@ -63,9 +82,17 @@ export function startWsClient(): { stop(): void } {
 
   async function connectLoop(): Promise<void> {
     while (!stopped) {
+      if (isRemoteAccessRevoked()) {
+        await sleep(2_000);
+        continue;
+      }
       const tokens = await ensureFreshAccessToken();
       if (!tokens) {
         // Not paired yet — wait + retry. Sleep a few seconds, then re-check.
+        await sleep(2_000);
+        continue;
+      }
+      if (isRemoteAccessRevoked()) {
         await sleep(2_000);
         continue;
       }
@@ -92,6 +119,12 @@ export function startWsClient(): { stop(): void } {
               if (!loadTokens()) {
                 console.log("[ws-client] tokens gone — closing");
                 try { ws?.close(4001, "logout"); } catch { /* ignored */ }
+                return;
+              }
+              if (isRemoteAccessRevoked()) {
+                console.log("[ws-client] remote access revoked — closing");
+                killActiveRemoteExecChildren("remote_access_revoked");
+                try { ws?.close(4003, "remote_access_revoked"); } catch { /* ignored */ }
                 return;
               }
               // Death detection: on laptop sleep/wake (Win11 esp.) the TCP
@@ -122,6 +155,10 @@ export function startWsClient(): { stop(): void } {
 
           ws.addEventListener("close", (evt) => {
             console.log(`[ws-client] closed (code=${evt.code}, reason=${evt.reason || "—"})`);
+            if (evt.reason === "logout" || evt.reason === "remote_access_revoked") {
+              killActiveRemoteExecChildren(evt.reason);
+            }
+            expireOpenConsentRequests(`ws_closed:${evt.reason || evt.code}`);
             if (pingTimer) {
               clearInterval(pingTimer);
               pingTimer = null;
@@ -135,6 +172,11 @@ export function startWsClient(): { stop(): void } {
       }
 
       if (stopped) break;
+      if (isRemoteAccessRevoked()) {
+        console.log("[ws-client] remote access revoked — reconnect paused");
+        await sleep(2_000);
+        continue;
+      }
       // If we're now un-paired (user logged out), don't burn cycles
       // reconnecting — the outer loop's ensureFreshAccessToken() will park
       // us in the 2s wait branch until the next pair.
@@ -178,6 +220,10 @@ function isSafeNonce(value: unknown): value is string {
   return typeof value === "string" && value.length >= 16 && value.length <= 160 && /^[A-Za-z0-9._~-]+$/.test(value);
 }
 
+function isSafeOperatorId(value: unknown): value is string {
+  return typeof value === "string" && value.length >= 1 && value.length <= 200 && !/[\0\x01-\x08\x0e-\x1f\x7f<>]/.test(value);
+}
+
 function canonicalJson(value: unknown): string {
   if (value === null || typeof value !== "object") return JSON.stringify(value);
   if (Array.isArray(value)) return `[${value.map((item) => canonicalJson(item)).join(",")}]`;
@@ -217,13 +263,19 @@ function pruneSeenExec(now: number): void {
 }
 
 interface ParsedExecRequest {
+  workspaceId: string;
   requestId: string;
   cmd: string[];
   cwd?: string;
   timeoutMs?: number;
-  operator: string;
+  operatorId: string;
   nonce: string;
+  scope: string;
+  approvalExpiresAt: number;
+  cmdSha256: string;
+  cwdSha256: string;
   seenUntil: number;
+  verifiedApproval: VerifiedApprovalProof;
 }
 
 type ExecParseResult =
@@ -245,6 +297,9 @@ function parseExecRequest(evt: ServerEvent): ExecParseResult {
     }
     cmd.push(arg);
   }
+  if (typeof p.cwd === "string" && p.cwd.length > 0 && p.cwd.trim().length === 0) {
+    return { ok: false, requestId, reason: "invalid cwd: whitespace-only" };
+  }
   const cwd = typeof p.cwd === "string" && p.cwd.length > 0 && p.cwd.length <= 512 && !/[\0\x01-\x08\x0e-\x1f\x7f]/.test(p.cwd)
     ? p.cwd
     : undefined;
@@ -253,12 +308,6 @@ function parseExecRequest(evt: ServerEvent): ExecParseResult {
     ? p.timeout_ms
     : undefined;
   if (p.timeout_ms !== undefined && timeoutMs === undefined) return { ok: false, requestId, reason: "invalid timeout" };
-  let operator = "unknown";
-  if (p.operator !== undefined) {
-    if (typeof p.operator !== "string" || p.operator.length > 200) return { ok: false, requestId, reason: "invalid operator" };
-    operator = p.operator;
-  }
-
   const tokens = loadTokens();
   if (!tokens?.active_workspace_id || tokens.active_workspace_id !== evt.workspace_id) {
     return { ok: false, requestId, reason: "workspace scope denied" };
@@ -273,10 +322,14 @@ function parseExecRequest(evt: ServerEvent): ExecParseResult {
   if (!isSafeId(claims.id, 1, 128) || claims.request_id !== requestId || claims.workspace_id !== evt.workspace_id) {
     return { ok: false, requestId, reason: "approval scope mismatch" };
   }
-  if (claims.scope !== "exec:run") return { ok: false, requestId, reason: "approval scope denied" };
+  const scope = claims.scope;
+  if (scope !== "exec:run") return { ok: false, requestId, reason: "approval scope denied" };
+  if (!isSafeOperatorId(claims.operator_id)) return { ok: false, requestId, reason: "missing signed operator_id" };
   if (!isSafeNonce(claims.nonce)) return { ok: false, requestId, reason: "invalid approval nonce" };
-  if (claims.cmd_sha256 !== sha256Json(cmd)) return { ok: false, requestId, reason: "approval command mismatch" };
-  if (claims.cwd_sha256 !== sha256Text(cwd ?? "")) return { ok: false, requestId, reason: "approval cwd mismatch" };
+  const cmdSha256 = sha256Json(cmd);
+  const cwdSha256 = sha256Text(cwd ?? "");
+  if (claims.cmd_sha256 !== cmdSha256) return { ok: false, requestId, reason: "approval command mismatch" };
+  if (claims.cwd_sha256 !== cwdSha256) return { ok: false, requestId, reason: "approval cwd mismatch" };
   if (claims.timeout_ms !== (timeoutMs ?? null)) return { ok: false, requestId, reason: "approval timeout mismatch" };
   if (typeof claims.expires_at !== "number" || !Number.isFinite(claims.expires_at)) {
     return { ok: false, requestId, reason: "invalid approval expiry" };
@@ -288,21 +341,31 @@ function parseExecRequest(evt: ServerEvent): ExecParseResult {
   if (expiresAt > now + EXEC_APPROVAL_MAX_FUTURE_MS) return { ok: false, requestId, reason: "approval expiry too far" };
   if (!verifyApprovalSignature(claims, approval.signature)) return { ok: false, requestId, reason: "invalid approval signature" };
 
-  pruneSeenExec(now);
-  if (seenExecRequestIds.has(requestId) || seenExecNonces.has(claims.nonce)) {
-    return { ok: false, requestId, reason: "duplicate exec request" };
-  }
-
   return {
     ok: true,
     request: {
+      workspaceId: evt.workspace_id,
       requestId,
       cmd,
       cwd,
       timeoutMs,
-      operator,
+      operatorId: claims.operator_id,
       nonce: claims.nonce,
+      scope,
+      approvalExpiresAt: expiresAt,
+      cmdSha256,
+      cwdSha256,
       seenUntil: Math.max(expiresAt, now + EXEC_SEEN_RETENTION_MS),
+      verifiedApproval: createVerifiedApprovalProof({
+        requestId,
+        workspaceId: evt.workspace_id,
+        operatorId: claims.operator_id,
+        nonce: claims.nonce,
+        scope,
+        cmdSha256,
+        cwdSha256,
+        expiresAt,
+      }),
     },
   };
 }
@@ -350,14 +413,14 @@ function handleMessage(raw: string): void {
       // whitelisted command and stream output back. Fire-and-forget
       // here — the runner will push exec.chunk / exec.done frames
       // back through activeSocket as it goes.
-      handleExecRequest(evt);
+      void handleExecRequest(evt);
       return;
     default:
       console.log(`[ws-client] unknown event kind: ${evt.kind}`);
   }
 }
 
-function handleExecRequest(evt: ServerEvent): void {
+async function handleExecRequest(evt: ServerEvent): Promise<void> {
   const parsed = parseExecRequest(evt);
   if (!parsed.ok) {
     sendExecFrame({
@@ -368,23 +431,147 @@ function handleExecRequest(evt: ServerEvent): void {
     });
     return;
   }
-  const { requestId, cmd, cwd, timeoutMs, operator, nonce, seenUntil } = parsed.request;
+  const {
+    workspaceId,
+    requestId,
+    cmd,
+    cwd,
+    timeoutMs,
+    operatorId,
+    nonce,
+    scope,
+    approvalExpiresAt,
+    cmdSha256,
+    cwdSha256,
+    seenUntil,
+    verifiedApproval,
+  } = parsed.request;
+  const reservation = createConsentReservation({
+    requestId,
+    nonce,
+    workspaceId,
+    operatorId,
+    cmd,
+    cwd,
+    cmdSha256,
+    cwdSha256,
+    scope,
+    approvalExpiresAt,
+  });
+  if (!reservation.ok) {
+    sendExecFrame({
+      kind: "exec.done",
+      request_id: requestId,
+      ok: false,
+      reason: reservation.status === "duplicate" ? "duplicate exec request" : `consent ${reservation.reason}`,
+    });
+    return;
+  }
+
+  pruneSeenExec(Date.now());
   seenExecRequestIds.set(requestId, seenUntil);
   seenExecNonces.set(nonce, seenUntil);
 
-  void runExec(
+  const consentId = reservation.id;
+  const consentCtx = {
+    workspaceId,
+    requestId,
+    nonce,
+    operatorId,
+    cmdSha256,
+    cwdSha256,
+    scope,
+    approvalExpiresAt,
+  };
+
+  if (isRemoteAccessRevoked()) {
+    markConsentRevoked(consentId);
+    sendExecFrame({
+      kind: "exec.done",
+      request_id: requestId,
+      ok: false,
+      reason: "remote access revoked",
+    });
+    return;
+  }
+
+  if (hasMatchingSessionGrant(consentCtx)) {
+    const decision = decide(consentId, "allowed", "session_grant");
+    if (!decision.ok) {
+      sendExecFrame({ kind: "exec.done", request_id: requestId, ok: false, reason: `consent ${decision.reason ?? decision.status}` });
+      return;
+    }
+    const consumed = consumeAllowedConsent(consentId, consentCtx);
+    if (!consumed.ok) {
+      sendExecFrame({ kind: "exec.done", request_id: requestId, ok: false, reason: consumed.reason });
+      return;
+    }
+    startRemoteExec({ workspaceId, requestId, cmd, cwd, timeoutMs, operatorId, verifiedApproval, consumedConsent: consumed.proof });
+    return;
+  }
+
+  sendExecFrame({
+    kind: "exec.pending",
+    request_id: requestId,
+    consent_id: consentId,
+    operator_id: operatorId,
+    cmd_sha256: cmdSha256,
+    cwd_sha256: cwdSha256,
+    scope,
+    expires_at: approvalExpiresAt,
+  });
+
+  const consent = await awaitConsent(consentId, Math.min(60_000, Math.max(0, approvalExpiresAt - Date.now())));
+  if (consent.status !== "allowed") {
+    sendExecFrame({
+      kind: "exec.done",
+      request_id: requestId,
+      ok: false,
+      reason: `consent ${consent.reason}`,
+    });
+    return;
+  }
+
+  const consumed = consumeAllowedConsent(consentId, consentCtx);
+  if (!consumed.ok) {
+    sendExecFrame({
+      kind: "exec.done",
+      request_id: requestId,
+      ok: false,
+      reason: consumed.reason,
+    });
+    return;
+  }
+  startRemoteExec({ workspaceId, requestId, cmd, cwd, timeoutMs, operatorId, verifiedApproval, consumedConsent: consumed.proof });
+}
+
+function startRemoteExec(req: {
+  workspaceId: string;
+  requestId: string;
+  cmd: string[];
+  cwd?: string;
+  timeoutMs?: number;
+  operatorId: string;
+  verifiedApproval: VerifiedApprovalProof;
+  consumedConsent: ConsumedConsentProof;
+}): void {
+  void runRemoteExec(
     {
-      cmd,
-      cwd,
-      timeoutMs,
-      requestId,
-      operator,
-      source: "ws",
+      cmd: req.cmd,
+      cwd: req.cwd,
+      timeoutMs: req.timeoutMs,
+      requestId: req.requestId,
+      workspaceId: req.workspaceId,
+      operatorId: req.operatorId,
+    },
+    {
+      verifiedApproval: req.verifiedApproval,
+      consumedConsent: req.consumedConsent,
     },
     (stream, data) => {
       sendExecFrame({
         kind: "exec.chunk",
-        request_id: requestId,
+        request_id: req.requestId,
         stream,
         data,
       });
@@ -392,7 +579,7 @@ function handleExecRequest(evt: ServerEvent): void {
   ).then((result) => {
     sendExecFrame({
       kind: "exec.done",
-      request_id: requestId,
+      request_id: req.requestId,
       ok: result.ok,
       exit_code: result.exitCode,
       wall_time_ms: result.wallTimeMs,
@@ -404,7 +591,7 @@ function handleExecRequest(evt: ServerEvent): void {
   }).catch((err) => {
     sendExecFrame({
       kind: "exec.done",
-      request_id: requestId,
+      request_id: req.requestId,
       ok: false,
       reason: `runner threw: ${err}`,
     });

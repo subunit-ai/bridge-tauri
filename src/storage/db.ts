@@ -51,6 +51,34 @@ CREATE TABLE IF NOT EXISTS decisions (
 
 CREATE INDEX IF NOT EXISTS idx_decisions_workspace ON decisions(workspace_id, status);
 
+CREATE TABLE IF NOT EXISTS consent_requests (
+  id TEXT PRIMARY KEY,
+  request_id TEXT NOT NULL,
+  nonce TEXT NOT NULL,
+  workspace_id TEXT NOT NULL,
+  operator_id TEXT NOT NULL,
+  cmd TEXT NOT NULL,                      -- JSON argv
+  cwd TEXT,
+  cmd_sha256 TEXT NOT NULL,
+  cwd_sha256 TEXT NOT NULL,
+  scope TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending'
+    CHECK (status IN ('pending', 'allowed', 'denied', 'expired', 'consumed', 'revoked', 'rate_limited')),
+  created_at INTEGER NOT NULL,
+  decided_at INTEGER,
+  consumed_at INTEGER,
+  expires_at INTEGER NOT NULL
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_consent_requests_workspace_request
+  ON consent_requests(workspace_id, request_id);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_consent_requests_workspace_nonce
+  ON consent_requests(workspace_id, nonce);
+
+CREATE INDEX IF NOT EXISTS idx_consent_requests_pending
+  ON consent_requests(workspace_id, operator_id, status, created_at);
+
 CREATE TABLE IF NOT EXISTS tasks (
   id TEXT PRIMARY KEY,
   workspace_id TEXT NOT NULL,

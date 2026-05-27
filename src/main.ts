@@ -9,8 +9,10 @@ import { decisionRoutes } from "./routes/decisions.ts";
 import { taskRoutes } from "./routes/tasks.ts";
 import { outboxRoutes } from "./routes/outbox.ts";
 import { execRoutes } from "./routes/exec.ts";
+import { consentRoutes } from "./routes/consent.ts";
+import { initConsentOnStartup, registerRemoteAccessHardStopHook } from "./exec/consent.ts";
 import { startOutboxWorker } from "./sync/outbox-worker.ts";
-import { startWsClient } from "./sync/ws-client.ts";
+import { disconnectWsClient, startWsClient } from "./sync/ws-client.ts";
 
 const LOCAL_API_TOKEN_PATH = join(config.stateDir, "local-api-token");
 
@@ -122,12 +124,16 @@ app.route("/decisions", decisionRoutes);
 app.route("/tasks", taskRoutes);
 app.route("/outbox", outboxRoutes);
 app.route("/exec", execRoutes);
+app.route("/consent", consentRoutes);
 
 app.notFound((c) => c.json({ error: "not_found" }, 404));
 app.onError((err, c) => {
   console.error("[bridge:error]", err);
   return c.json({ error: "internal_error" }, 500);
 });
+
+initConsentOnStartup();
+registerRemoteAccessHardStopHook(disconnectWsClient);
 
 const server = Bun.serve({
   port: config.port,

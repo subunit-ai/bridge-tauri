@@ -23,11 +23,15 @@
  *   - On completion the resolved promise carries `{ ok, exitCode,
  *     wallTimeMs, stdoutBytes, stderrBytes }`.
  */
-import { spawn } from "node:child_process";
+import { spawn, type ChildProcessByStdio } from "node:child_process";
+import { createHash } from "node:crypto";
 import { existsSync, appendFileSync, mkdirSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { resolve as resolvePath, dirname } from "node:path";
+import type { Readable } from "node:stream";
+import { kvSet } from "../storage/db.ts";
 import { getAccessMode } from "./access-mode.ts";
+import { getRemoteAccessState, isConsumedConsentProof, type ConsumedConsentProof } from "./consent.ts";
 
 // Restricted-mode whitelist.
 // Strictly read-only diagnostic tools — NO interpreters, NO compilers,
@@ -61,17 +65,62 @@ const WHITELIST: ReadonlySet<string> = new Set([
 const HOME = homedir();
 const HOME_REAL = realpathSync(HOME);
 const AUDIT_PATH = resolvePath(HOME, ".config/subunit-bridge/audit.jsonl");
+const EXEC_LAST_ACTIVE_KEY = "exec.last_active_at";
 const DEFAULT_TIMEOUT_MS = 60_000;
 const MAX_TIMEOUT_MS = 300_000;
 const MAX_STDOUT_BYTES = 1_000_000; // 1 MB cap so a runaway stream can't OOM the bridge.
+const VERIFIED_APPROVAL_BRAND = Symbol.for("subunit.exec.verifiedApproval");
+type RemoteChild = ChildProcessByStdio<null, Readable, Readable>;
 
-export interface ExecRequest {
+interface ActiveRemoteChild {
+  child: RemoteChild;
+  pid: number | null;
+  processGroupId: number | null;
+}
+
+interface BaseExecRequest {
   cmd: string[];        // argv — first element is the binary
   cwd?: string;         // defaults to user home
   timeoutMs?: number;   // defaults to 60s, capped at 300s
   requestId: string;    // operator-supplied — used in audit log + stream protocol
+}
+
+export interface ExecRequest extends BaseExecRequest {
   operator?: string;    // operator identifier (email or sub) for audit
-  source: "ws" | "local"; // where the request originated
+  source: "local";      // local self-test only; WS must use runRemoteExec
+}
+
+export interface RemoteExecRequest extends BaseExecRequest {
+  workspaceId: string;
+  operatorId: string;
+}
+
+interface InternalExecRequest extends BaseExecRequest {
+  operator?: string;
+  source: "ws" | "local";
+}
+
+export interface VerifiedApprovalProof {
+  readonly [VERIFIED_APPROVAL_BRAND]: true;
+  requestId: string;
+  workspaceId: string;
+  operatorId: string;
+  nonce: string;
+  scope: string;
+  cmdSha256: string;
+  cwdSha256: string;
+  expiresAt: number;
+}
+
+export interface VerifiedApprovalProofInput {
+  requestId: string;
+  workspaceId: string;
+  operatorId: string;
+  nonce: string;
+  scope: string;
+  cmdSha256: string;
+  cwdSha256: string;
+  expiresAt: number;
 }
 
 export interface ExecResult {
@@ -86,12 +135,99 @@ export interface ExecResult {
 
 export type StreamHandler = (stream: "stdout" | "stderr", data: string) => void;
 
+const activeRemoteChildren = new Map<RemoteChild, ActiveRemoteChild>();
+
 function writeAudit(entry: Record<string, unknown>): void {
   try {
     mkdirSync(dirname(AUDIT_PATH), { recursive: true });
     appendFileSync(AUDIT_PATH, JSON.stringify(entry) + "\n");
   } catch (err) {
     console.warn("[exec] audit write failed:", err);
+  }
+}
+
+function canonicalJson(value: unknown): string {
+  if (value === null || typeof value !== "object") return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map((item) => canonicalJson(item)).join(",")}]`;
+  const record = value as Record<string, unknown>;
+  return `{${Object.keys(record).sort().map((key) => `${JSON.stringify(key)}:${canonicalJson(record[key])}`).join(",")}}`;
+}
+
+function sha256Json(value: unknown): string {
+  return createHash("sha256").update(canonicalJson(value)).digest("hex");
+}
+
+function sha256Text(value: string): string {
+  return createHash("sha256").update(value).digest("hex");
+}
+
+function isVerifiedApprovalProof(value: unknown): value is VerifiedApprovalProof {
+  return typeof value === "object" && value !== null && (value as { [VERIFIED_APPROVAL_BRAND]?: unknown })[VERIFIED_APPROVAL_BRAND] === true;
+}
+
+export function createVerifiedApprovalProof(input: VerifiedApprovalProofInput): VerifiedApprovalProof {
+  return Object.freeze({
+    [VERIFIED_APPROVAL_BRAND]: true as const,
+    requestId: input.requestId,
+    workspaceId: input.workspaceId,
+    operatorId: input.operatorId,
+    nonce: input.nonce,
+    scope: input.scope,
+    cmdSha256: input.cmdSha256,
+    cwdSha256: input.cwdSha256,
+    expiresAt: input.expiresAt,
+  });
+}
+
+function registerActiveRemoteChild(child: RemoteChild): void {
+  const pid = typeof child.pid === "number" ? child.pid : null;
+  activeRemoteChildren.set(child, {
+    child,
+    pid,
+    processGroupId: process.platform === "win32" ? null : pid,
+  });
+}
+
+function killWindowsProcessTree(entry: ActiveRemoteChild): void {
+  if (entry.pid === null) {
+    try { entry.child.kill("SIGKILL"); } catch { /* ignored */ }
+    return;
+  }
+  try {
+    const killer = spawn("taskkill", ["/PID", String(entry.pid), "/T", "/F"], {
+      stdio: "ignore",
+      windowsHide: true,
+    });
+    killer.on("error", () => { /* ignored */ });
+    killer.unref();
+  } catch {
+    try { entry.child.kill("SIGKILL"); } catch { /* ignored */ }
+  }
+}
+
+function killPosixProcessGroup(entry: ActiveRemoteChild): void {
+  if (entry.processGroupId !== null) {
+    try {
+      process.kill(-entry.processGroupId, "SIGKILL");
+      return;
+    } catch {
+      // Fall through to direct child kill if the process group is already gone.
+    }
+  }
+  try { entry.child.kill("SIGKILL"); } catch { /* ignored */ }
+}
+
+export function killActiveRemoteExecChildren(reason = "remote_access_revoked"): void {
+  const entries = Array.from(activeRemoteChildren.values());
+  for (const entry of entries) {
+    if (process.platform === "win32") {
+      killWindowsProcessTree(entry);
+    } else {
+      killPosixProcessGroup(entry);
+    }
+  }
+  if (entries.length > 0) {
+    console.warn(`[exec] killed active remote child process groups: ${reason}`);
   }
 }
 
@@ -262,11 +398,65 @@ function validateRestrictedArgs(bin: string, args: string[], cwd: string): strin
   return `no restricted argument rule for: ${bin}`;
 }
 
-export async function runExec(
-  req: ExecRequest,
+export async function runExec(req: ExecRequest, onChunk: StreamHandler): Promise<ExecResult> {
+  return runExecInternal(req, onChunk);
+}
+
+export async function runRemoteExec(
+  req: RemoteExecRequest,
+  proofs: { verifiedApproval: VerifiedApprovalProof; consumedConsent: ConsumedConsentProof },
+  onChunk: StreamHandler,
+): Promise<ExecResult> {
+  if (req.cwd !== undefined && req.cwd.trim().length === 0) {
+    return { ok: false, exitCode: null, wallTimeMs: 0, stdoutBytes: 0, stderrBytes: 0, truncated: false, reason: "invalid cwd: whitespace-only" };
+  }
+  const cmdSha256 = sha256Json(req.cmd);
+  const cwdSha256 = sha256Text(req.cwd ?? "");
+  if (!isVerifiedApprovalProof(proofs.verifiedApproval)) {
+    return { ok: false, exitCode: null, wallTimeMs: 0, stdoutBytes: 0, stderrBytes: 0, truncated: false, reason: "missing verified approval proof" };
+  }
+  if (!isConsumedConsentProof(proofs.consumedConsent)) {
+    return { ok: false, exitCode: null, wallTimeMs: 0, stdoutBytes: 0, stderrBytes: 0, truncated: false, reason: "missing consumed consent proof" };
+  }
+  if (
+    proofs.verifiedApproval.requestId !== req.requestId ||
+    proofs.verifiedApproval.workspaceId !== req.workspaceId ||
+    proofs.verifiedApproval.operatorId !== req.operatorId ||
+    proofs.verifiedApproval.scope !== "exec:run" ||
+    proofs.verifiedApproval.cmdSha256 !== cmdSha256 ||
+    proofs.verifiedApproval.cwdSha256 !== cwdSha256 ||
+    proofs.consumedConsent.requestId !== req.requestId ||
+    proofs.consumedConsent.workspaceId !== req.workspaceId ||
+    proofs.consumedConsent.operatorId !== req.operatorId ||
+    proofs.consumedConsent.cmdSha256 !== cmdSha256 ||
+    proofs.consumedConsent.cwdSha256 !== cwdSha256 ||
+    proofs.consumedConsent.scope !== proofs.verifiedApproval.scope
+  ) {
+    return { ok: false, exitCode: null, wallTimeMs: 0, stdoutBytes: 0, stderrBytes: 0, truncated: false, reason: "remote proof scope mismatch" };
+  }
+  if (proofs.verifiedApproval.expiresAt <= Date.now()) {
+    return { ok: false, exitCode: null, wallTimeMs: 0, stdoutBytes: 0, stderrBytes: 0, truncated: false, reason: "approval expired" };
+  }
+
+  return runExecInternal(
+    {
+      cmd: req.cmd,
+      cwd: req.cwd,
+      timeoutMs: req.timeoutMs,
+      requestId: req.requestId,
+      operator: req.operatorId,
+      source: "ws",
+    },
+    onChunk,
+  );
+}
+
+async function runExecInternal(
+  req: InternalExecRequest,
   onChunk: StreamHandler,
 ): Promise<ExecResult> {
   const startedAt = Date.now();
+  kvSet(EXEC_LAST_ACTIVE_KEY, String(startedAt));
   const cwd = req.cwd && req.cwd.trim() ? req.cwd : HOME;
   const mode = getAccessMode();
   const audit: Record<string, unknown> = {
@@ -317,21 +507,29 @@ export async function runExec(
     }
   }
 
-  audit.outcome = "started";
-  writeAudit(audit);
-
   const timeoutMs = Math.min(MAX_TIMEOUT_MS, Math.max(1_000, req.timeoutMs ?? DEFAULT_TIMEOUT_MS));
   let stdoutBytes = 0;
   let stderrBytes = 0;
   let truncated = false;
 
   return new Promise<ExecResult>((resolve) => {
-    let child;
+    if (req.source === "ws" && getRemoteAccessState() !== "active") {
+      const wallTimeMs = Date.now() - startedAt;
+      writeAudit({ ...audit, outcome: "rejected:remote_access_revoked", wall_time_ms: wallTimeMs });
+      resolve({ ok: false, exitCode: null, wallTimeMs, stdoutBytes: 0, stderrBytes: 0, truncated: false, reason: "remote access revoked" });
+      return;
+    }
+
+    audit.outcome = "started";
+    writeAudit(audit);
+
+    let child: RemoteChild;
     try {
       child = spawn(req.cmd[0]!, req.cmd.slice(1), {
         cwd,
         env: process.env,
         stdio: ["ignore", "pipe", "pipe"],
+        detached: req.source === "ws" && process.platform !== "win32",
       });
     } catch (err) {
       const wallTimeMs = Date.now() - startedAt;
@@ -339,6 +537,8 @@ export async function runExec(
       resolve({ ok: false, exitCode: null, wallTimeMs, stdoutBytes: 0, stderrBytes: 0, truncated: false, reason: `spawn failed: ${err}` });
       return;
     }
+
+    if (req.source === "ws") registerActiveRemoteChild(child);
 
     const killTimer = setTimeout(() => {
       try { child.kill("SIGKILL"); } catch { /* ignored */ }
@@ -366,6 +566,7 @@ export async function runExec(
 
     child.on("error", (err) => {
       clearTimeout(killTimer);
+      if (req.source === "ws") activeRemoteChildren.delete(child);
       const wallTimeMs = Date.now() - startedAt;
       writeAudit({ ...audit, outcome: "child_error", error: String(err), wall_time_ms: wallTimeMs });
       resolve({ ok: false, exitCode: null, wallTimeMs, stdoutBytes, stderrBytes, truncated, reason: String(err) });
@@ -373,6 +574,7 @@ export async function runExec(
 
     child.on("close", (exitCode) => {
       clearTimeout(killTimer);
+      if (req.source === "ws") activeRemoteChildren.delete(child);
       const wallTimeMs = Date.now() - startedAt;
       writeAudit({ ...audit, outcome: "completed", exit_code: exitCode, wall_time_ms: wallTimeMs, stdout_bytes: stdoutBytes, stderr_bytes: stderrBytes, truncated });
       resolve({ ok: exitCode === 0, exitCode, wallTimeMs, stdoutBytes, stderrBytes, truncated });
