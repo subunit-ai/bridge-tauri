@@ -495,6 +495,23 @@ async function handleExecRequest(evt: ServerEvent): Promise<void> {
     return;
   }
 
+  // P2 Operator-Bypass: interne subunit-Operator-Maschine → keine lokale Consent-Abfrage.
+  // NACH der Revoke-Prüfung (Revoke gewinnt) + über denselben atomaren decide+consume-Pfad.
+  if (isOperatorBypassActive()) {
+    const decision = decide(consentId, "allowed", "operator_bypass");
+    if (!decision.ok) {
+      sendExecFrame({ kind: "exec.done", request_id: requestId, ok: false, reason: `consent ${decision.reason ?? decision.status}` });
+      return;
+    }
+    const consumed = consumeAllowedConsent(consentId, consentCtx);
+    if (!consumed.ok) {
+      sendExecFrame({ kind: "exec.done", request_id: requestId, ok: false, reason: consumed.reason });
+      return;
+    }
+    startRemoteExec({ workspaceId, requestId, cmd, cwd, timeoutMs, operatorId, verifiedApproval, consumedConsent: consumed.proof });
+    return;
+  }
+
   if (hasMatchingSessionGrant(consentCtx)) {
     const decision = decide(consentId, "allowed", "session_grant");
     if (!decision.ok) {
@@ -543,6 +560,22 @@ async function handleExecRequest(evt: ServerEvent): Promise<void> {
     return;
   }
   startRemoteExec({ workspaceId, requestId, cmd, cwd, timeoutMs, operatorId, verifiedApproval, consumedConsent: consumed.proof });
+}
+
+/**
+ * Operator-Bypass (P2): Auf einer Maschine, die mit einem SUBUNIT-Operator-Account
+ * angemeldet ist, entfällt die lokale Consent-Abfrage (interner Gebrauch = voller Zugriff).
+ * Sicherheits-Invarianten bleiben unangetastet:
+ *  (1) Das Ed25519-Remote-Approval ist VORHER verifiziert (verifiedApproval).
+ *  (2) Revoke wird davor geprüft und gewinnt (kein Bypass bei revoked).
+ *  (3) Verbrauch läuft über denselben atomaren decide()+consumeAllowedConsent()-Pfad
+ *      wie ein normaler Allow → Nonce/Replay/TOCTOU-Schutz bleibt.
+ * `is_operator` stammt SERVER-attestiert aus /auth/me (auth.subunit.ai), NICHT aus einem
+ * clientseitig dekodierten Token → nicht lokal fälschbar. Kunden (is_operator=false)
+ * behalten das Default-Deny-Consent-Gate.
+ */
+function isOperatorBypassActive(): boolean {
+  return loadTokens()?.is_operator === true;
 }
 
 function startRemoteExec(req: {
