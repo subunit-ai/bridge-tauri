@@ -22,6 +22,9 @@ CREATE TABLE IF NOT EXISTS tokens (
   access_expires_at INTEGER NOT NULL,
   active_workspace_id TEXT,
   is_operator INTEGER NOT NULL DEFAULT 0,
+  -- Unix-Sekunden der letzten SERVER-frischen Operator-Attestierung (aus /auth/me).
+  -- Treibt den Operator-Bypass-Freshness-Check (fail-closed nach TTL). 0 = nie attestiert.
+  operator_attested_at INTEGER NOT NULL DEFAULT 0,
   device_label TEXT,
   issued_at INTEGER NOT NULL DEFAULT (unixepoch()),
   last_refresh_at INTEGER NOT NULL DEFAULT (unixepoch())
@@ -127,6 +130,16 @@ CREATE INDEX IF NOT EXISTS idx_pair_attempts_created ON pair_attempts(created_at
 `;
 
 db.exec(SCHEMA);
+
+// Idempotente Migration für bestehende DBs (CREATE TABLE IF NOT EXISTS fügt keine
+// Spalten zu existierenden Tabellen hinzu). Bei fehlender Spalte: hinzufügen, Default 0
+// (= nie attestiert → Operator-Bypass fail-closed bis zur nächsten /auth/me-Attestierung).
+{
+  const cols = db.query<{ name: string }, []>("PRAGMA table_info(tokens)").all();
+  if (!cols.some((c) => c.name === "operator_attested_at")) {
+    db.exec("ALTER TABLE tokens ADD COLUMN operator_attested_at INTEGER NOT NULL DEFAULT 0");
+  }
+}
 
 export function kvGet(key: string): string | null {
   const row = db.query<{ value: string }, [string]>("SELECT value FROM kv WHERE key = ?").get(key);

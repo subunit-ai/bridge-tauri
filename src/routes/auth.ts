@@ -4,7 +4,7 @@ import { z } from "zod";
 import { db } from "../storage/db.ts";
 import { loginWithPassword, ensureFreshAccessToken, logout, fetchMe } from "../sync/auth-client.ts";
 import { disconnectWsClient } from "../sync/ws-client.ts";
-import { loadTokens } from "../storage/tokens.ts";
+import { loadTokens, setOperatorAttestation } from "../storage/tokens.ts";
 import { getAccessMode, setAccessMode } from "../exec/access-mode.ts";
 
 export const authRoutes = new Hono();
@@ -155,6 +155,8 @@ authRoutes.get("/me", async (c) => {
   if (!fresh) return c.json({ error: "not_paired" }, 401);
   try {
     const me = await fetchMe(fresh.access_token);
+    // Server-frischer Operator-Status → persistieren (treibt den Operator-Bypass-Freshness-Check).
+    setOperatorAttestation(me.user.is_operator);
     return c.json(me);
   } catch (err) {
     console.error("[auth/me] upstream failed:", redactError(err));

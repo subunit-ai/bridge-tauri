@@ -1,5 +1,5 @@
 import { config } from "../config.ts";
-import { loadTokens, saveTokens, touchAccessExpiry, clearTokens, type StoredTokens } from "../storage/tokens.ts";
+import { loadTokens, saveTokens, touchAccessExpiry, clearTokens, setOperatorAttestation, type StoredTokens } from "../storage/tokens.ts";
 
 interface LoginResponse {
   ok: true;
@@ -55,6 +55,8 @@ export async function loginWithPassword(email: string, password: string, deviceL
     access_expires_at: Math.floor(Date.now() / 1000) + data.expires_in,
     active_workspace_id: data.active_workspace_id,
     is_operator: me.user.is_operator,
+    // is_operator kommt frisch aus /auth/me → jetzt attestiert (saveTokens stempelt identisch).
+    operator_attested_at: me.user.is_operator ? Math.floor(Date.now() / 1000) : 0,
     device_label: deviceLabel ?? null,
   };
   saveTokens(stored);
@@ -79,7 +81,20 @@ export async function refreshTokens(): Promise<StoredTokens | null> {
   const data = (await res.json()) as RefreshResponse;
   const newExpiresAt = Math.floor(Date.now() / 1000) + data.expires_in;
   touchAccessExpiry(data.access_token, newExpiresAt);
-  return { ...cur, access_token: data.access_token, access_expires_at: newExpiresAt };
+  // Operator-Status server-frisch nach-attestieren (treibt den Bypass-Freshness-Check).
+  // Best-effort: schlägt /me fehl, bleibt die alte Attestierung stehen und altert aus
+  // (fail-closed) — der Token-Refresh selbst war erfolgreich und bleibt gültig.
+  let isOperator = cur.is_operator;
+  let attestedAt = cur.operator_attested_at;
+  try {
+    const me = await fetchMe(data.access_token);
+    setOperatorAttestation(me.user.is_operator);
+    isOperator = me.user.is_operator;
+    attestedAt = me.user.is_operator ? Math.floor(Date.now() / 1000) : 0;
+  } catch (e) {
+    console.error(`[auth-client] operator re-attest via /me failed (status unchanged): ${redactForLog(String(e))}`);
+  }
+  return { ...cur, access_token: data.access_token, access_expires_at: newExpiresAt, is_operator: isOperator, operator_attested_at: attestedAt };
 }
 
 export async function ensureFreshAccessToken(): Promise<StoredTokens | null> {

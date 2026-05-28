@@ -562,6 +562,13 @@ async function handleExecRequest(evt: ServerEvent): Promise<void> {
   startRemoteExec({ workspaceId, requestId, cmd, cwd, timeoutMs, operatorId, verifiedApproval, consumedConsent: consumed.proof });
 }
 
+// Operator-Attestierung gilt nur FRISCH (server-bestätigt via /auth/me). Sie wird beim
+// Pairing gesetzt und bei jedem Token-Refresh + /auth/me erneuert. Bleibt sie länger als
+// die TTL ohne Erneuerung (Server nicht erreichbar, Status entzogen), fällt der Bypass
+// fail-closed auf die normale Consent-Abfrage zurück. Refresh-Cadence << TTL, daher im
+// Normalbetrieb keine Reibung für echte Operatoren.
+const OPERATOR_ATTESTATION_TTL_MS = 24 * 60 * 60 * 1000;
+
 /**
  * Operator-Bypass (P2): Auf einer Maschine, die mit einem SUBUNIT-Operator-Account
  * angemeldet ist, entfällt die lokale Consent-Abfrage (interner Gebrauch = voller Zugriff).
@@ -571,11 +578,16 @@ async function handleExecRequest(evt: ServerEvent): Promise<void> {
  *  (3) Verbrauch läuft über denselben atomaren decide()+consumeAllowedConsent()-Pfad
  *      wie ein normaler Allow → Nonce/Replay/TOCTOU-Schutz bleibt.
  * `is_operator` stammt SERVER-attestiert aus /auth/me (auth.subunit.ai), NICHT aus einem
- * clientseitig dekodierten Token → nicht lokal fälschbar. Kunden (is_operator=false)
- * behalten das Default-Deny-Consent-Gate.
+ * clientseitig dekodierten Token. Zusätzlich FAIL-CLOSED: nur bei frischer Attestierung
+ * (< TTL) — ein entzogener/veralteter Operator-Status altert aus und der Bypass greift
+ * nicht mehr. Kunden (is_operator=false) behalten das Default-Deny-Consent-Gate.
  */
 function isOperatorBypassActive(): boolean {
-  return loadTokens()?.is_operator === true;
+  const tokens = loadTokens();
+  if (tokens?.is_operator !== true) return false;
+  const attestedAtMs = (tokens.operator_attested_at ?? 0) * 1000;
+  if (attestedAtMs <= 0) return false;
+  return Date.now() - attestedAtMs < OPERATOR_ATTESTATION_TTL_MS;
 }
 
 function startRemoteExec(req: {
