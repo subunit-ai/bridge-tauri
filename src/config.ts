@@ -34,7 +34,7 @@ export const config = {
   execApprovalPublicKey: (process.env.EXEC_APPROVAL_PUBLIC_KEY ?? "").replace(/\\n/g, "\n"),
   stateDir,
   dbPath: join(stateDir, "bridge.sqlite"),
-  version: "0.4.1", // IM EINKLANG MIT DEM git-Tag halten (bridge-tauri vX.Y.Z) — sonst zeigt der Installer eine falsche Version
+  version: "0.4.2", // IM EINKLANG MIT DEM git-Tag halten (bridge-tauri vX.Y.Z) — sonst zeigt der Installer eine falsche Version
 };
 
 export function isLoopbackHost(host: string): boolean {
