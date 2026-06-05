@@ -30,7 +30,7 @@ interface MeResponse {
 function redactForLog(value: string): string {
   return value
     .replace(/Bearer\s+[A-Za-z0-9._~+/=-]+/g, "Bearer [redacted]")
-    .replace(/"(access_token|refresh_token|password)"\s*:\s*"[^"]*"/g, "\"$1\":\"[redacted]\"")
+    .replace(/"(access_token|refresh_token|id_token|client_secret|password)"\s*:\s*"[^"]*"/g, "\"$1\":\"[redacted]\"")
     .slice(0, 500);
 }
 
@@ -63,7 +63,21 @@ export async function loginWithPassword(email: string, password: string, deviceL
   return stored;
 }
 
-export async function refreshTokens(): Promise<StoredTokens | null> {
+// Single-Flight-Lock: parallele Aufrufer (Background-Sync + WS + UI) teilen sich EINEN
+// /refresh-Roundtrip. Sonst feuern mehrere gleichzeitig mit demselben refresh_token; nutzt der
+// Server Refresh-Token-Rotation, scheitert der zweite mit 401 → clearTokens() → unerwarteter
+// Logout. (Gemini-Review P1)
+let inflightRefresh: Promise<StoredTokens | null> | null = null;
+
+export function refreshTokens(): Promise<StoredTokens | null> {
+  if (inflightRefresh) return inflightRefresh;
+  inflightRefresh = doRefresh().finally(() => {
+    inflightRefresh = null;
+  });
+  return inflightRefresh;
+}
+
+async function doRefresh(): Promise<StoredTokens | null> {
   const cur = loadTokens();
   if (!cur) return null;
   const res = await fetch(`${config.authBaseUrl}/refresh`, {
@@ -79,22 +93,42 @@ export async function refreshTokens(): Promise<StoredTokens | null> {
     throw new Error(`auth_refresh_failed: ${res.status}`);
   }
   const data = (await res.json()) as RefreshResponse;
-  const newExpiresAt = Math.floor(Date.now() / 1000) + data.expires_in;
-  touchAccessExpiry(data.access_token, newExpiresAt);
-  // Operator-Status server-frisch nach-attestieren (treibt den Bypass-Freshness-Check).
-  // Best-effort: schlägt /me fehl, bleibt die alte Attestierung stehen und altert aus
-  // (fail-closed) — der Token-Refresh selbst war erfolgreich und bleibt gültig.
-  let isOperator = cur.is_operator;
-  let attestedAt = cur.operator_attested_at;
-  try {
-    const me = await fetchMe(data.access_token);
-    setOperatorAttestation(me.user.is_operator);
-    isOperator = me.user.is_operator;
-    attestedAt = me.user.is_operator ? Math.floor(Date.now() / 1000) : 0;
-  } catch (e) {
-    console.error(`[auth-client] operator re-attest via /me failed (status unchanged): ${redactForLog(String(e))}`);
+
+  // Identität des erneuerten Tokens server-frisch bestätigen — fail-CLOSED: ergibt der (ggf. via
+  // /adopt client-gelieferte) refresh_token einen ANDEREN User als den gespeicherten, liegt eine
+  // Token-Family-Confusion vor (access≠refresh aus verschiedenen Accounts) → hart abmelden.
+  // (Codex P1-3 / Gemini P3)
+  const me = await fetchMe(data.access_token).catch((e: unknown) => {
+    // /me nicht erreichbar → Identität NICHT prüfbar. Den erneuerten Token NICHT committen (kein
+    // ungeprüfter/fremder Token unter alter Identität), aber auch NICHT ausloggen (kein clearTokens
+    // → kein spontaner Logout bei transientem /me-Ausfall). Der nächste Versuch prüft erneut. (Codex-ReReview P1)
+    console.error(`[auth-client] refresh /me check failed → renewed token NOT committed: ${redactForLog(String(e))}`);
+    return null;
+  });
+  if (me === null) return cur;
+  if (me.user.id !== cur.user_id) {
+    console.error("[auth-client] refresh identity mismatch (token-family confusion) → clearing tokens");
+    clearTokens();
+    return null;
   }
-  return { ...cur, access_token: data.access_token, access_expires_at: newExpiresAt, is_operator: isOperator, operator_attested_at: attestedAt };
+
+  // TOCTOU: Während der Netzwerk-Roundtrips kann ein paralleles Logout/Adopt den lokalen Token-Zustand
+  // geändert haben — den erneuerten Token NICHT blind über die (evtl. neue/gelöschte) Zeile schreiben.
+  // loadTokens→touchAccessExpiry läuft synchron (kein await dazwischen) → atomar in JS' Single-Thread. (Codex-ReReview P1)
+  const now = loadTokens();
+  if (!now || now.user_id !== cur.user_id || now.access_token !== cur.access_token) {
+    return now;
+  }
+  const newExpiresAt = Math.floor(Date.now() / 1000) + data.expires_in;
+  setOperatorAttestation(me.user.is_operator);
+  touchAccessExpiry(data.access_token, newExpiresAt);
+  return {
+    ...now,
+    access_token: data.access_token,
+    access_expires_at: newExpiresAt,
+    is_operator: me.user.is_operator,
+    operator_attested_at: me.user.is_operator ? Math.floor(Date.now() / 1000) : 0,
+  };
 }
 
 export async function ensureFreshAccessToken(): Promise<StoredTokens | null> {

@@ -10,6 +10,7 @@ import { taskRoutes } from "./routes/tasks.ts";
 import { outboxRoutes } from "./routes/outbox.ts";
 import { execRoutes } from "./routes/exec.ts";
 import { consentRoutes } from "./routes/consent.ts";
+import { activityRoutes } from "./routes/activity.ts";
 import { initConsentOnStartup, registerRemoteAccessHardStopHook } from "./exec/consent.ts";
 import { startOutboxWorker } from "./sync/outbox-worker.ts";
 import { disconnectWsClient, startWsClient } from "./sync/ws-client.ts";
@@ -125,6 +126,7 @@ app.route("/tasks", taskRoutes);
 app.route("/outbox", outboxRoutes);
 app.route("/exec", execRoutes);
 app.route("/consent", consentRoutes);
+app.route("/activity", activityRoutes);
 
 app.notFound((c) => c.json({ error: "not_found" }, 404));
 app.onError((err, c) => {

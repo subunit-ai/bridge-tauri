@@ -33,8 +33,10 @@ import {
   hasMatchingSessionGrant,
   isRemoteAccessRevoked,
   markConsentRevoked,
+  setSessionGrantForConsent,
   type ConsumedConsentProof,
 } from "../exec/consent.ts";
+import { forgeAct, forgeCapture, killActiveForgeChildren } from "../forge/control.ts";
 
 const PING_INTERVAL_MS = 30_000;
 const SERVER_SILENCE_TIMEOUT_MS = 90_000; // 3 missed pings → force reconnect
@@ -58,10 +60,13 @@ interface ServerEvent {
 let activeSocket: WebSocket | null = null;
 const seenExecRequestIds = new Map<string, number>();
 const seenExecNonces = new Map<string, number>();
+const seenForgeRequestIds = new Map<string, number>();
+const seenForgeNonces = new Map<string, number>();
 
 export function disconnectWsClient(reason = "logout"): void {
   if (reason === "logout" || reason === "remote_access_revoked") {
     killActiveRemoteExecChildren(reason);
+    killActiveForgeChildren(reason);
   }
   if (activeSocket) {
     try { activeSocket.close(4001, reason); } catch { /* ignored */ }
@@ -124,6 +129,7 @@ export function startWsClient(): { stop(): void } {
               if (isRemoteAccessRevoked()) {
                 console.log("[ws-client] remote access revoked — closing");
                 killActiveRemoteExecChildren("remote_access_revoked");
+                killActiveForgeChildren("remote_access_revoked");
                 try { ws?.close(4003, "remote_access_revoked"); } catch { /* ignored */ }
                 return;
               }
@@ -157,6 +163,7 @@ export function startWsClient(): { stop(): void } {
             console.log(`[ws-client] closed (code=${evt.code}, reason=${evt.reason || "—"})`);
             if (evt.reason === "logout" || evt.reason === "remote_access_revoked") {
               killActiveRemoteExecChildren(evt.reason);
+              killActiveForgeChildren(evt.reason);
             }
             expireOpenConsentRequests(`ws_closed:${evt.reason || evt.code}`);
             if (pingTimer) {
@@ -415,6 +422,10 @@ function handleMessage(raw: string): void {
       // back through activeSocket as it goes.
       void handleExecRequest(evt);
       return;
+    case "forge.request":
+      // Forge Remote-Control (Computer Use): Screenshot/Input hinter Approval + Consent.
+      void handleForgeRequest(evt);
+      return;
     default:
       console.log(`[ws-client] unknown event kind: ${evt.kind}`);
   }
@@ -560,6 +571,198 @@ async function handleExecRequest(evt: ServerEvent): Promise<void> {
     return;
   }
   startRemoteExec({ workspaceId, requestId, cmd, cwd, timeoutMs, operatorId, verifiedApproval, consumedConsent: consumed.proof });
+}
+
+// ── Forge Remote-Control (Computer Use) — scope "forge:control". ──────────────
+// Spiegelt den Exec-Flow, mit dem Session-Modell: Approval/Consent gelten für die SESSION
+// (FIXES cmd_sha256), die konkrete Aktion ist Request-Payload. Nur die ERSTE Aktion einer
+// Session holt Consent → SessionGrant; Folgeaktionen laufen direkt (kein Prompt, kein
+// Reservation-/Rate-Churn pro Klick) — der Ed25519-Approval wird trotzdem pro Aktion geprüft.
+const FORGE_SCOPE = "forge:control";
+const FORGE_CMD_SHA256 = sha256Json(["forge:control"]);
+const FORGE_CWD_SHA256 = sha256Text("");
+const FORGE_SESSION_GRANT_SECONDS = 600; // 10-min-Steuer-Session pro Consent
+
+type ForgeAction = { kind: "capture" } | { kind: "act"; action: Record<string, unknown> };
+
+interface ParsedForgeRequest {
+  workspaceId: string;
+  requestId: string;
+  operatorId: string;
+  nonce: string;
+  action: ForgeAction;
+  approvalExpiresAt: number;
+}
+
+function parseForgeRequest(
+  evt: ServerEvent,
+): { ok: true; request: ParsedForgeRequest } | { ok: false; requestId: string; reason: string } {
+  const p = evt.payload;
+  const requestId = isSafeId(p.request_id, 1, 128) ? p.request_id : "";
+  if (!requestId) return { ok: false, requestId: "", reason: "malformed forge.request" };
+  if (!isSafeId(evt.workspace_id, 1, 128)) return { ok: false, requestId, reason: "invalid workspace scope" };
+
+  const rawAction = isRecord(p.action) ? p.action : null;
+  let action: ForgeAction;
+  if (rawAction?.kind === "capture") {
+    action = { kind: "capture" };
+  } else if (rawAction?.kind === "act" && isRecord(rawAction.action)) {
+    action = { kind: "act", action: rawAction.action };
+  } else {
+    return { ok: false, requestId, reason: "invalid action" };
+  }
+
+  const tokens = loadTokens();
+  if (!tokens?.active_workspace_id || tokens.active_workspace_id !== evt.workspace_id) {
+    return { ok: false, requestId, reason: "workspace scope denied" };
+  }
+
+  const approval = isRecord(p.approval) ? p.approval : null;
+  if (!approval || approval.alg !== "Ed25519" || typeof approval.signature !== "string" || !isRecord(approval.payload)) {
+    return { ok: false, requestId, reason: "missing forge approval" };
+  }
+  const claims = approval.payload;
+  if (claims.approved !== true) return { ok: false, requestId, reason: "forge not approved" };
+  if (!isSafeId(claims.id, 1, 128) || claims.request_id !== requestId || claims.workspace_id !== evt.workspace_id) {
+    return { ok: false, requestId, reason: "approval scope mismatch" };
+  }
+  if (claims.scope !== FORGE_SCOPE) return { ok: false, requestId, reason: "approval scope denied" };
+  if (!isSafeOperatorId(claims.operator_id)) return { ok: false, requestId, reason: "missing signed operator_id" };
+  if (!isSafeNonce(claims.nonce)) return { ok: false, requestId, reason: "invalid approval nonce" };
+  // FIXES Session-cmd_sha256 — die konkrete Aktion ist NICHT signiert (siehe Header).
+  if (claims.cmd_sha256 !== FORGE_CMD_SHA256) return { ok: false, requestId, reason: "approval command mismatch" };
+  if (claims.cwd_sha256 !== FORGE_CWD_SHA256) return { ok: false, requestId, reason: "approval cwd mismatch" };
+  // Die KONKRETE Aktion ist mitsigniert → kein Austausch/Replay der Aktion bei aktivem Grant
+  // (Codex-P1.1). p.action ist exakt das vom Server signierte Objekt (canonicalJson-stabil).
+  if (claims.action_sha256 !== sha256Json(p.action)) return { ok: false, requestId, reason: "approval action mismatch" };
+  if (typeof claims.expires_at !== "number" || !Number.isFinite(claims.expires_at)) {
+    return { ok: false, requestId, reason: "invalid approval expiry" };
+  }
+  const now = Date.now();
+  const expiresAt = claims.expires_at > 1_000_000_000_000 ? claims.expires_at : claims.expires_at * 1000;
+  if (expiresAt <= now) return { ok: false, requestId, reason: "approval expired" };
+  if (expiresAt > now + EXEC_APPROVAL_MAX_FUTURE_MS) return { ok: false, requestId, reason: "approval expiry too far" };
+  if (!verifyApprovalSignature(claims, approval.signature)) return { ok: false, requestId, reason: "invalid approval signature" };
+
+  return {
+    ok: true,
+    request: { workspaceId: evt.workspace_id, requestId, operatorId: claims.operator_id, nonce: claims.nonce, action, approvalExpiresAt: expiresAt },
+  };
+}
+
+async function executeForge(requestId: string, action: ForgeAction): Promise<void> {
+  // Letzter Revoke-Check unmittelbar vor der Ausführung (TOCTOU: Revoke nach Consent).
+  if (isRemoteAccessRevoked()) {
+    sendExecFrame({ kind: "forge.result", request_id: requestId, ok: false, reason: "remote access revoked" });
+    return;
+  }
+  if (action.kind === "capture") {
+    const r = await forgeCapture();
+    sendExecFrame(
+      r.ok
+        ? { kind: "forge.result", request_id: requestId, ok: true, png_base64: r.pngBase64 }
+        : { kind: "forge.result", request_id: requestId, ok: false, reason: r.reason },
+    );
+  } else {
+    const r = await forgeAct(JSON.stringify(action.action));
+    sendExecFrame(
+      r.ok
+        ? { kind: "forge.result", request_id: requestId, ok: true }
+        : { kind: "forge.result", request_id: requestId, ok: false, reason: r.reason },
+    );
+  }
+}
+
+async function handleForgeRequest(evt: ServerEvent): Promise<void> {
+  const parsed = parseForgeRequest(evt);
+  if (!parsed.ok) {
+    sendExecFrame({ kind: "forge.result", request_id: parsed.requestId, ok: false, reason: parsed.reason });
+    return;
+  }
+  const { workspaceId, requestId, operatorId, nonce, action, approvalExpiresAt } = parsed.request;
+
+  if (isRemoteAccessRevoked()) {
+    sendExecFrame({ kind: "forge.result", request_id: requestId, ok: false, reason: "remote access revoked" });
+    return;
+  }
+
+  // Replay-Schutz: jedes signierte Approval (requestId/nonce) nur EINMAL — auch im Grant-Pfad
+  // (sonst könnte ein abgefangenes forge.request-Frame innerhalb der Gültigkeit wiederholt
+  // werden). (Codex-P1.1)
+  const nowMs = Date.now();
+  for (const [k, exp] of seenForgeNonces) if (exp <= nowMs) seenForgeNonces.delete(k);
+  for (const [k, exp] of seenForgeRequestIds) if (exp <= nowMs) seenForgeRequestIds.delete(k);
+  if (seenForgeRequestIds.has(requestId) || seenForgeNonces.has(nonce)) {
+    sendExecFrame({ kind: "forge.result", request_id: requestId, ok: false, reason: "duplicate forge request (replay)" });
+    return;
+  }
+  const seenUntil = Math.max(approvalExpiresAt, nowMs + EXEC_SEEN_RETENTION_MS);
+  seenForgeRequestIds.set(requestId, seenUntil);
+  seenForgeNonces.set(nonce, seenUntil);
+
+  const consentCtx = {
+    workspaceId,
+    requestId,
+    nonce,
+    operatorId,
+    cmdSha256: FORGE_CMD_SHA256,
+    cwdSha256: FORGE_CWD_SHA256,
+    scope: FORGE_SCOPE,
+    approvalExpiresAt,
+  };
+
+  // Laufende Steuer-Session (Grant) oder interne Operator-Maschine → direkt ausführen,
+  // KEIN neuer Consent (sonst Prompt + Rate-Limit pro Klick).
+  if (hasMatchingSessionGrant(consentCtx) || isOperatorBypassActive()) {
+    await executeForge(requestId, action);
+    return;
+  }
+
+  // Erste Aktion der Session: Consent einholen, dann SessionGrant für die Folgeaktionen.
+  const reservation = createConsentReservation({
+    requestId,
+    nonce,
+    workspaceId,
+    operatorId,
+    cmd: ["forge:control"],
+    cmdSha256: FORGE_CMD_SHA256,
+    cwdSha256: FORGE_CWD_SHA256,
+    scope: FORGE_SCOPE,
+    approvalExpiresAt,
+  });
+  if (!reservation.ok) {
+    sendExecFrame({
+      kind: "forge.result",
+      request_id: requestId,
+      ok: false,
+      reason: reservation.status === "duplicate" ? "duplicate forge request" : `consent ${reservation.reason}`,
+    });
+    return;
+  }
+  const consentId = reservation.id;
+
+  sendExecFrame({
+    kind: "forge.pending",
+    request_id: requestId,
+    consent_id: consentId,
+    operator_id: operatorId,
+    scope: FORGE_SCOPE,
+    expires_at: approvalExpiresAt,
+  });
+
+  const consent = await awaitConsent(consentId, Math.min(60_000, Math.max(0, approvalExpiresAt - Date.now())));
+  if (consent.status !== "allowed") {
+    sendExecFrame({ kind: "forge.result", request_id: requestId, ok: false, reason: `consent ${consent.reason}` });
+    return;
+  }
+  const consumed = consumeAllowedConsent(consentId, consentCtx);
+  if (!consumed.ok) {
+    sendExecFrame({ kind: "forge.result", request_id: requestId, ok: false, reason: consumed.reason });
+    return;
+  }
+  // Steuer-Session etablieren → Folgeaktionen ohne erneuten Prompt (bis Ablauf/Revoke).
+  setSessionGrantForConsent(consentId, FORGE_SESSION_GRANT_SECONDS);
+  await executeForge(requestId, action);
 }
 
 // Operator-Attestierung gilt nur FRISCH (server-bestätigt via /auth/me). Sie wird beim

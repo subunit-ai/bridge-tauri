@@ -4,7 +4,7 @@ import { z } from "zod";
 import { db } from "../storage/db.ts";
 import { loginWithPassword, ensureFreshAccessToken, logout, fetchMe } from "../sync/auth-client.ts";
 import { disconnectWsClient } from "../sync/ws-client.ts";
-import { loadTokens, setOperatorAttestation } from "../storage/tokens.ts";
+import { loadTokens, saveTokens, setOperatorAttestation, type StoredTokens } from "../storage/tokens.ts";
 import { getAccessMode, setAccessMode } from "../exec/access-mode.ts";
 
 export const authRoutes = new Hono();
@@ -95,8 +95,28 @@ function recordPairAttempt(ip: string, email: string): void {
 function redactError(err: unknown): string {
   return String(err)
     .replace(/Bearer\s+[A-Za-z0-9._~+/=-]+/g, "Bearer [redacted]")
-    .replace(/(access_token|refresh_token|password)=\S+/g, "$1=[redacted]")
+    // JSON-Payloads ("access_token":"…") maskieren — /auth/adopt konsumiert JSON, ein Fehler der
+    // den Body stringifiziert würde sonst Tokens im Klartext loggen. Feldliste deckt auch
+    // id_token/client_secret ab. (Codex P2-8 / Gemini P2 / ReReview P2)
+    .replace(/"(access_token|refresh_token|id_token|client_secret|password)"\s*:\s*"[^"]*"/g, '"$1":"[redacted]"')
+    .replace(/(access_token|refresh_token|id_token|client_secret|password)=\S+/g, "$1=[redacted]")
     .slice(0, 500);
+}
+
+// Liest den exp-Claim (Sekunden seit Epoch) aus einem JWT. Die Token-Lebensdauer wird IMMER
+// hieraus abgeleitet statt aus dem client-gelieferten expires_in — sonst könnte ein lokaler
+// Aufrufer mit einem riesigen Wert den proaktiven Refresh unterdrücken (oder mit 0 einen
+// Refresh-Loop erzwingen). Gibt 0 zurück, wenn kein dekodierbares exp vorliegt. (Codex P2-7 / Gemini P2)
+function accessTokenExpiry(token: string): number {
+  try {
+    const payload = token.split(".")[1];
+    if (!payload) return 0;
+    const json = JSON.parse(Buffer.from(payload, "base64url").toString("utf8")) as { exp?: number };
+    if (typeof json.exp === "number" && json.exp > 0) return json.exp;
+  } catch {
+    /* kein dekodierbares JWT → Fallback durch Aufrufer */
+  }
+  return 0;
 }
 
 authRoutes.post("/pair/start", (c) => {
@@ -127,6 +147,68 @@ authRoutes.post("/pair", async (c) => {
   } catch (err) {
     console.error("[pair] failed:", redactError(err));
     return c.json({ error: "pair_failed" }, 401);
+  }
+});
+
+// POST /auth/adopt — Sonar übergibt sein OAuth-Token (Browser-Login) an die Bridge, damit sie
+// pairt + sich mit dem Server verbindet. Token-basierte Alternative zum Passwort-Pairing.
+// Lokal-token-gated (globale Middleware). Das Token wird gegen /auth/me VALIDIERT (gefälschte/
+// abgelaufene Tokens scheitern), bevor es gespeichert wird — kanonische Claims kommen vom Server.
+const AdoptSchema = z.object({
+  access_token: z.string().min(10).max(8192),
+  refresh_token: z.string().min(10).max(8192),
+  // expires_in wird BEWUSST nicht akzeptiert — die Lebensdauer kommt aus dem JWT-exp
+  // (accessTokenExpiry), nicht aus dem manipulierbaren Body. Ein evtl. mitgesendetes Feld ignoriert zod.
+  active_workspace_id: z.string().max(128).optional(),
+  device_label: z.string().max(120).optional(),
+});
+
+authRoutes.post("/adopt", async (c) => {
+  const body = AdoptSchema.safeParse(await c.req.json().catch(() => ({})));
+  if (!body.success) return c.json({ error: "invalid_request" }, 400);
+  try {
+    const me = await fetchMe(body.data.access_token); // validiert das Token + holt kanonische Claims
+
+    // Identity-Pinning: ist die Bridge bereits an einen User gekoppelt, NICHT stillschweigend auf
+    // einen anderen Account umschalten — ein lokaler Token-Halter könnte sonst die Bridge-Identität
+    // austauschen (auch auf einen Operator). Account-Wechsel erfordert explizites /auth/logout. (Codex P1-2)
+    const existing = loadTokens();
+    if (existing && existing.user_id !== me.user.id) {
+      return c.json({ error: "identity_mismatch", paired_user: existing.user_id }, 409);
+    }
+
+    // active_workspace_id ist client-geliefert → nur übernehmen, wenn der User laut Server (kanonisch)
+    // dort Mitglied ist; sonst Server-Default (null). Verhindert lokale Workspace-Poisoning. (Codex P1-4 / Gemini P2)
+    const requestedWs = body.data.active_workspace_id ?? null;
+    const activeWorkspaceId = requestedWs && me.workspaces.some((w) => w.id === requestedWs) ? requestedWs : null;
+
+    // Lebensdauer aus dem JWT-exp ableiten (nicht aus dem Request-Body); Fallback 1h. (Codex P2-7 / Gemini P2)
+    const expFromJwt = accessTokenExpiry(body.data.access_token);
+    const accessExpiresAt = expFromJwt > 0 ? expFromJwt : Math.floor(Date.now() / 1000) + 3600;
+
+    const stored: StoredTokens = {
+      user_id: me.user.id,
+      email: me.user.email,
+      access_token: body.data.access_token,
+      refresh_token: body.data.refresh_token,
+      access_expires_at: accessExpiresAt,
+      active_workspace_id: activeWorkspaceId,
+      is_operator: me.user.is_operator,
+      operator_attested_at: me.user.is_operator ? Math.floor(Date.now() / 1000) : 0,
+      device_label: body.data.device_label ?? "sonar",
+    };
+    saveTokens(stored);
+    return c.json({
+      ok: true,
+      paired: true,
+      user_id: stored.user_id,
+      email: stored.email,
+      is_operator: stored.is_operator,
+      active_workspace_id: stored.active_workspace_id,
+    });
+  } catch (err) {
+    console.error("[adopt] failed:", redactError(err));
+    return c.json({ error: "adopt_failed" }, 401);
   }
 });
 
