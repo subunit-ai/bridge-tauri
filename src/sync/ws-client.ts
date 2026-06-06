@@ -43,7 +43,13 @@ const SERVER_SILENCE_TIMEOUT_MS = 90_000; // 3 missed pings → force reconnect
 const RECONNECT_BASE_MS = 1_000;
 const RECONNECT_MAX_MS = 60_000;
 const RECONNECT_JITTER_MS = 500;
-const EXEC_APPROVAL_MAX_FUTURE_MS = 5 * 60_000;
+// Akzeptanzfenster für die (server-signierte) Approval-Expiry. MUSS größer sein als das größte
+// Ausstell-Window der API (exec/forge ≤ 5 min), sonst hat eine zurückgehende Client-Uhr NULL
+// Spielraum → "approval expiry too far" (Finn-Bug 2026-06-06: Windows-Uhr-Drift). 5 min Window
+// + 10 min Clock-Skew-Grace = 15 min → toleriert ~10 min Rückwärts-Skew bei exec UND forge.
+// Replay bleibt unberührt (Nonce-/requestId-Dedup, s. EXEC_SEEN_RETENTION_MS); dies ist nur die
+// Zeit-Plausibilität. Vorwärts-Skew deckt der Expired-Check über das Window selbst ab.
+const EXEC_APPROVAL_MAX_FUTURE_MS = 15 * 60_000;
 const EXEC_SEEN_RETENTION_MS = 10 * 60_000;
 const MAX_EXEC_ARG_LENGTH = 2048;
 const MAX_EXEC_ARGS = 64;
