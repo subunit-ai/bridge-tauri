@@ -87,6 +87,32 @@ function isPublicRoute(method: string, path: string): boolean {
   return method === "GET" && (path === "/" || path === "/health");
 }
 
+// Self-service actions the bridge's OWN served UI (GET /) performs from a
+// loopback browser: pair / switch access-mode / logout. These run AFTER the
+// loopback-host + loopback-origin checks below, so they're reachable only from
+// this machine — but they carry no local API token by design (the served HTML
+// page has none, and the first-ever pairing must work before a token exists).
+// Sensitive routes (/exec, /consent, /decisions, /tasks, /auth/adopt) keep
+// requiring the token.
+function isLocalUiRoute(method: string, path: string): boolean {
+  return method === "POST" && (path === "/auth/pair" || path === "/auth/access" || path === "/auth/logout");
+}
+
+// Strict loopback-origin check for the tokenless UI routes. Deliberately does
+// NOT consult the broader LOCAL_CORS_ORIGINS allowlist: a permitted *remote*
+// web origin must never be able to drive a victim's browser into flipping
+// access-mode (CSRF). Only an explicit http(s) loopback Origin — i.e. the
+// daemon's own served page in a local browser — qualifies.
+function isLoopbackOrigin(origin: string | undefined): boolean {
+  if (!origin) return false;
+  try {
+    const url = new URL(origin);
+    return (url.protocol === "http:" || url.protocol === "https:") && isLoopbackHost(url.hostname);
+  } catch {
+    return false;
+  }
+}
+
 // CORS for local apps. Defaults to loopback origins only; set
 // LOCAL_CORS_ORIGINS to a comma-separated exact-origin allowlist.
 app.use("*", async (c, next) => {
@@ -112,6 +138,15 @@ app.use("*", async (c, next) => {
   const origin = c.req.header("Origin");
   if (origin && !isAllowedCorsOrigin(origin)) {
     return c.json({ error: "forbidden" }, 403);
+  }
+  // Self-service UI actions (pair/access/logout) carry no local API token, but
+  // ONLY when the request has an explicit loopback Origin — i.e. it genuinely
+  // came from the daemon's own served page in a local browser. Origin-less
+  // local clients and any non-loopback origin fall through to the bearer-token
+  // requirement below (no bypass).
+  if (isLocalUiRoute(c.req.method, c.req.path) && isLoopbackOrigin(c.req.header("Origin"))) {
+    await next();
+    return;
   }
   if (!hasValidBearer(c.req.header("Authorization"))) {
     c.header("WWW-Authenticate", "Bearer");
