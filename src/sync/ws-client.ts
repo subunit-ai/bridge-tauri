@@ -175,8 +175,11 @@ export function startWsClient(): { stop(): void } {
             console.log(`[ws-client] closed (code=${evt.code}, reason=${evt.reason || "—"})`);
             if (evt.reason === "logout" || evt.reason === "remote_access_revoked") {
               killActiveRemoteExecChildren(evt.reason);
-              killActiveForgeChildren(evt.reason);
             }
+            // Forge IMMER beim WS-Abriss stoppen: ohne WS gibt es keinen Operator-Push-Pfad mehr →
+            // ein Live-Stream darf NICHT bis zum Max-Timer weiter den Kunden-Bildschirm abgreifen
+            // (Privacy; Codex/Gemini-Fund 2026-06-08 "Geräte-Disconnect stoppt forge-control nicht").
+            killActiveForgeChildren(`ws_closed:${evt.reason || evt.code}`);
             expireOpenConsentRequests(`ws_closed:${evt.reason || evt.code}`);
             if (pingTimer) {
               clearInterval(pingTimer);
@@ -603,7 +606,7 @@ type ForgeAction =
   | { kind: "capture" }
   | { kind: "act"; action: Record<string, unknown> }
   | { kind: "stream.start"; fps: number; quality: number; maxWidth: number }
-  | { kind: "stream.stop" };
+  | { kind: "stream.stop"; streamId?: string };
 
 // Genau EIN aktiver Live-Stream pro Bridge (ein Gerät, ein zuschauender Operator).
 let activeStreamHandle: ForgeStreamHandle | null = null;
@@ -643,7 +646,8 @@ function parseForgeRequest(
       maxWidth: intOr(rawAction.max_width, 1280),
     };
   } else if (rawAction?.kind === "stream.stop") {
-    action = { kind: "stream.stop" };
+    // stream_id ist Teil der signierten Aktion (action_sha256 deckt es) → nur diesen Stream stoppen.
+    action = { kind: "stream.stop", streamId: typeof rawAction.stream_id === "string" ? rawAction.stream_id : undefined };
   } else {
     return { ok: false, requestId, reason: "invalid action" };
   }
@@ -709,7 +713,7 @@ async function executeForge(requestId: string, action: ForgeAction): Promise<voi
   } else if (action.kind === "stream.start") {
     startForgeStream(requestId, action);
   } else {
-    stopForgeStream(requestId);
+    stopForgeStream(requestId, action.streamId);
   }
 }
 
@@ -768,14 +772,21 @@ function startForgeStream(
 }
 
 /** Beendet den aktiven Live-Stream (löst `forge.stream.ended` aus). */
-function stopForgeStream(requestId: string): void {
+function stopForgeStream(requestId: string, streamId?: string): void {
+  // stream_id-gebunden (Defense-in-Depth): nur den GENANNTEN Stream stoppen. Bei 1 Stream/Gerät
+  // heute ohnehin eindeutig; schützt aber gegen einen Stop, der einen zwischenzeitlich neu
+  // gestarteten Stream träfe. Fehlt streamId (alte api), gilt das alte Verhalten (aktiven stoppen).
+  if (streamId && activeStreamId && streamId !== activeStreamId) {
+    sendExecFrame({ kind: "forge.stream.ended", request_id: requestId, stream_id: streamId, reason: "stream id mismatch" });
+    return;
+  }
   if (activeStreamHandle) {
     activeStreamHandle.stop();
   } else {
     sendExecFrame({
       kind: "forge.stream.ended",
       request_id: requestId,
-      stream_id: requestId,
+      stream_id: streamId ?? requestId,
       reason: "no active stream",
     });
   }

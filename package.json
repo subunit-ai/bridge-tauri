@@ -1,6 +1,6 @@
 {
   "name": "subunit-bridge",
-  "version": "0.4.4",
+  "version": "0.4.5",
   "description": "Subunit Bridge Daemon — local cross-app sync + MCP server",
   "private": true,
   "type": "module",
