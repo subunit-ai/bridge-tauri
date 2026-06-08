@@ -36,7 +36,13 @@ import {
   setSessionGrantForConsent,
   type ConsumedConsentProof,
 } from "../exec/consent.ts";
-import { forgeAct, forgeCapture, killActiveForgeChildren } from "../forge/control.ts";
+import {
+  forgeAct,
+  forgeCapture,
+  forgeStream,
+  killActiveForgeChildren,
+  type ForgeStreamHandle,
+} from "../forge/control.ts";
 
 const PING_INTERVAL_MS = 30_000;
 const SERVER_SILENCE_TIMEOUT_MS = 90_000; // 3 missed pings → force reconnect
@@ -588,8 +594,20 @@ const FORGE_SCOPE = "forge:control";
 const FORGE_CMD_SHA256 = sha256Json(["forge:control"]);
 const FORGE_CWD_SHA256 = sha256Text("");
 const FORGE_SESSION_GRANT_SECONDS = 600; // 10-min-Steuer-Session pro Consent
+// Harte Maximaldauer eines Live-Streams (L3): an die Grant-Fenster gebunden, damit ein Stream
+// NIE über die Einwilligung hinaus (oder ewig ungesehen) capturet. Explizites Stop + Revoke
+// beenden ihn früher.
+const FORGE_STREAM_MAX_MS = FORGE_SESSION_GRANT_SECONDS * 1000;
 
-type ForgeAction = { kind: "capture" } | { kind: "act"; action: Record<string, unknown> };
+type ForgeAction =
+  | { kind: "capture" }
+  | { kind: "act"; action: Record<string, unknown> }
+  | { kind: "stream.start"; fps: number; quality: number; maxWidth: number }
+  | { kind: "stream.stop" };
+
+// Genau EIN aktiver Live-Stream pro Bridge (ein Gerät, ein zuschauender Operator).
+let activeStreamHandle: ForgeStreamHandle | null = null;
+let activeStreamId: string | null = null;
 
 interface ParsedForgeRequest {
   workspaceId: string;
@@ -609,11 +627,23 @@ function parseForgeRequest(
   if (!isSafeId(evt.workspace_id, 1, 128)) return { ok: false, requestId, reason: "invalid workspace scope" };
 
   const rawAction = isRecord(p.action) ? p.action : null;
+  const intOr = (v: unknown, def: number): number =>
+    typeof v === "number" && Number.isFinite(v) ? Math.trunc(v) : def;
   let action: ForgeAction;
   if (rawAction?.kind === "capture") {
     action = { kind: "capture" };
   } else if (rawAction?.kind === "act" && isRecord(rawAction.action)) {
     action = { kind: "act", action: rawAction.action };
+  } else if (rawAction?.kind === "stream.start") {
+    // Werte sind Teil der signierten Aktion; forge-control clampt sie zusätzlich (1..30 etc.).
+    action = {
+      kind: "stream.start",
+      fps: intOr(rawAction.fps, 8),
+      quality: intOr(rawAction.quality, 55),
+      maxWidth: intOr(rawAction.max_width, 1280),
+    };
+  } else if (rawAction?.kind === "stream.stop") {
+    action = { kind: "stream.stop" };
   } else {
     return { ok: false, requestId, reason: "invalid action" };
   }
@@ -669,13 +699,85 @@ async function executeForge(requestId: string, action: ForgeAction): Promise<voi
         ? { kind: "forge.result", request_id: requestId, ok: true, png_base64: r.pngBase64 }
         : { kind: "forge.result", request_id: requestId, ok: false, reason: r.reason },
     );
-  } else {
+  } else if (action.kind === "act") {
     const r = await forgeAct(JSON.stringify(action.action));
     sendExecFrame(
       r.ok
         ? { kind: "forge.result", request_id: requestId, ok: true }
         : { kind: "forge.result", request_id: requestId, ok: false, reason: r.reason },
     );
+  } else if (action.kind === "stream.start") {
+    startForgeStream(requestId, action);
+  } else {
+    stopForgeStream(requestId);
+  }
+}
+
+/**
+ * Startet einen Live-Stream (L3). Sendet KEIN `forge.result`, sondern `forge.stream.started`
+ * (sobald der Header da ist) + dann pro Bild `forge.frame` (base64-JPEG) + am Ende
+ * `forge.stream.ended`. Nur EIN Stream pro Bridge — ein evtl. laufender wird zuvor beendet.
+ * Ein Maximaldauer-Timer + der Revoke-Kill-Switch (`activeForgeChildren`) garantieren, dass
+ * ein Stream nie über die Einwilligung hinaus weiterläuft.
+ */
+function startForgeStream(
+  requestId: string,
+  action: Extract<ForgeAction, { kind: "stream.start" }>,
+): void {
+  if (activeStreamHandle) {
+    try {
+      activeStreamHandle.stop();
+    } catch {
+      /* ignored */
+    }
+    activeStreamHandle = null;
+    activeStreamId = null;
+  }
+  const streamId = requestId;
+  activeStreamId = streamId;
+
+  const maxTimer = setTimeout(() => {
+    if (activeStreamId === streamId && activeStreamHandle) activeStreamHandle.stop();
+  }, FORGE_STREAM_MAX_MS);
+
+  activeStreamHandle = forgeStream(
+    { fps: action.fps, quality: action.quality, maxWidth: action.maxWidth },
+    (header) =>
+      sendExecFrame({
+        kind: "forge.stream.started",
+        request_id: requestId,
+        stream_id: streamId,
+        w: header.w,
+        h: header.h,
+        fps: header.fps,
+        format: header.format,
+      }),
+    (jpeg) => {
+      if (activeStreamId !== streamId) return; // veraltetes/ersetztes Frame verwerfen
+      sendExecFrame({ kind: "forge.frame", stream_id: streamId, jpeg_base64: jpeg.toString("base64") });
+    },
+    (reason) => {
+      clearTimeout(maxTimer);
+      if (activeStreamId === streamId) {
+        activeStreamHandle = null;
+        activeStreamId = null;
+      }
+      sendExecFrame({ kind: "forge.stream.ended", request_id: requestId, stream_id: streamId, reason });
+    },
+  );
+}
+
+/** Beendet den aktiven Live-Stream (löst `forge.stream.ended` aus). */
+function stopForgeStream(requestId: string): void {
+  if (activeStreamHandle) {
+    activeStreamHandle.stop();
+  } else {
+    sendExecFrame({
+      kind: "forge.stream.ended",
+      request_id: requestId,
+      stream_id: requestId,
+      reason: "no active stream",
+    });
   }
 }
 
